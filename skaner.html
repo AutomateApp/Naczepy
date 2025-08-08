@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Skaner kodów (mobile)</title>
+  <style>
+    :root { color-scheme: dark light; }
+    body { margin:0; font-family: system-ui, Arial, sans-serif; background:#0b0f14; color:#e7eef6; }
+    header { padding:14px 16px; background:#111826; position:sticky; top:0; z-index:2 }
+    h1 { margin:0; font-size:18px }
+    .wrap { padding:12px; display:grid; gap:12px }
+    .box { background:#0f1724; border:1px solid #253246; border-radius:14px; overflow:hidden }
+    .video { width:100%; background:#000 }
+    video { width:100%; height:auto; display:block; }
+    .controls { display:flex; flex-wrap:wrap; gap:8px; padding:12px }
+    .controls > * { border:1px solid #354255; background:#1a2433; color:#e7eef6; padding:10px 12px; border-radius:10px; font-size:15px }
+    button:disabled { opacity:.5 }
+    select { min-width: 180px }
+    .result { padding:12px; border-radius:12px; border:1px solid #2a3648; background:#0f1724 }
+    .result h2 { margin:0 0 6px; font-size:16px; color:#a5b4c7 }
+    .val { word-break:break-all; font-size:20px; font-weight:600 }
+    .hint { color:#9fb2c9; font-size:13px }
+    .ok { color:#4ade80 } .err { color:#f87171 }
+    .footer { text-align:center; color:#7486a0; font-size:12px; padding:8px 0 24px }
+  </style>
+</head>
+<body>
+  <header><h1>📷 Skaner kodów</h1></header>
+  <div class="wrap">
+    <div class="box">
+      <video id="preview" playsinline muted></video>
+      <div class="controls">
+        <button id="start">▶️ Start</button>
+        <button id="stop" disabled>⏹️ Stop</button>
+        <button id="torch" disabled>🔦 Latarka</button>
+        <select id="camera"></select>
+        <button id="copy" disabled>📋 Kopiuj</button>
+      </div>
+    </div>
+    <div class="result">
+      <h2>Odczyt:</h2>
+      <div class="val" id="value">—</div>
+      <div class="hint" id="meta">Format: — • Próby: 0</div>
+      <div class="hint" id="status">Status: oczekiwanie…</div>
+    </div>
+    <details>
+      <summary>Wpisz ręcznie (awaryjnie)</summary>
+      <div class="controls" style="border:none; padding-inline:0">
+        <input id="manual" placeholder="Wpisz kod" style="flex:1; padding:10px; border-radius:10px; border:1px solid #354255; background:#0f1724; color:#e7eef6"/>
+        <button id="useManual">Użyj</button>
+      </div>
+    </details>
+    <div class="footer">Wymaga HTTPS dla iOS. Obsługa: QR, EAN/UPC, Code128/39, ITF (ZXing).</div>
+  </div>
+
+  <!-- Prefer native BarcodeDetector if available -->
+  <script>
+    const supportsBarcodeDetector = 'BarcodeDetector' in window;
+    if (supportsBarcodeDetector) {
+      // Preload formats (optional on some browsers)
+      try { BarcodeDetector.getSupportedFormats?.(); } catch(e) {}
+    }
+  </script>
+  <!-- ZXing UMD fallback -->
+  <script src="https://unpkg.com/@zxing/library@0.21.2"></script>
+
+  <script>
+    const video = document.getElementById('preview');
+    const startBtn = document.getElementById('start');
+    const stopBtn  = document.getElementById('stop');
+    const torchBtn = document.getElementById('torch');
+    const cameraSel= document.getElementById('camera');
+    const copyBtn  = document.getElementById('copy');
+    const valueEl  = document.getElementById('value');
+    const metaEl   = document.getElementById('meta');
+    const statusEl = document.getElementById('status');
+    const manual   = document.getElementById('manual');
+    const useManual= document.getElementById('useManual');
+
+    let zxingReader = null;
+    let currentDeviceId = null;
+    let scanning = false;
+    let tries = 0;
+    let torchOn = false;
+    let nativeDetector = null;
+    let nativeStream = null;
+    let nativeTrack = null;
+    let nativeRAF = null;
+
+    function setStatus(text, ok) {
+      statusEl.innerHTML = ok ? `Status: <span class="ok">${text}</span>` : `Status: ${text}`;
+    }
+
+    async function listCameras() {
+      try {
+        if (!zxingReader) zxingReader = new ZXing.BrowserMultiFormatReader();
+        const devices = await zxingReader.listVideoInputDevices();
+        cameraSel.innerHTML = '';
+        devices.forEach((d, i) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Kamera ${i+1}`;
+          cameraSel.appendChild(opt);
+        });
+        const rear = devices.find(d => /back|rear|tyl/i.test(d.label));
+        cameraSel.value = rear?.deviceId || devices.at(-1)?.deviceId || '';
+        currentDeviceId = cameraSel.value || null;
+        cameraSel.disabled = devices.length <= 1;
+        startBtn.disabled = !currentDeviceId && !supportsBarcodeDetector;
+      } catch (e) {
+        setStatus('Brak dostępu do kamer (sprawdź HTTPS/uprawnienia).');
+        console.error(e);
+      }
+    }
+
+    async function startNative() {
+      // Native BarcodeDetector path
+      const constraints = { video: { facingMode: { ideal: 'environment' } } };
+      nativeStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = nativeStream;
+      await video.play();
+      nativeTrack = nativeStream.getVideoTracks()[0];
+      const detector = new BarcodeDetector({ formats: ['qr_code','ean_13','ean_8','code_128','code_39','itf','upc_a','upc_e'] });
+      nativeDetector = detector;
+      tries = 0; scanning = true; setStatus('skanowanie…');
+      stopBtn.disabled = false; startBtn.disabled = true; copyBtn.disabled = true;
+      await setupTorch(nativeTrack);
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      const loop = async () => {
+        if (!scanning) return;
+        try {
+          canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const bitmap = await createImageBitmap(canvas);
+          const codes = await detector.detect(bitmap);
+          if (codes && codes.length) {
+            const c = codes[0];
+            valueEl.textContent = c.rawValue || '';
+            metaEl.textContent = `Format: ${c.format || '—'} • Próby: ${tries}`;
+            setStatus('✔ Odczytano', true);
+            copyBtn.disabled = false;
+          } else {
+            tries++; metaEl.textContent = `Format: — • Próby: ${tries}`;
+          }
+        } catch (e) {
+          // ignore NotFound
+        }
+        nativeRAF = requestAnimationFrame(loop);
+      };
+      loop();
+    }
+
+    async function startZXing() {
+      tries = 0; scanning = true; setStatus('skanowanie…');
+      copyBtn.disabled = true; stopBtn.disabled = false; startBtn.disabled = true;
+      if (!zxingReader) zxingReader = new ZXing.BrowserMultiFormatReader();
+      await zxingReader.decodeFromVideoDevice(currentDeviceId ?? null, video, (result, err) => {
+        if (!scanning) return;
+        if (result) {
+          valueEl.textContent = result.getText();
+          metaEl.textContent = `Format: ${result.getBarcodeFormat()} • Próby: ${tries}`;
+          setStatus('✔ Odczytano', true);
+          copyBtn.disabled = false;
+        } else {
+          tries++; metaEl.textContent = `Format: — • Próby: ${tries}`;
+        }
+      });
+      await setupTorch(video.srcObject?.getVideoTracks?.()[0]);
+    }
+
+    async function start() {
+      try {
+        if ('BarcodeDetector' in window) {
+          await startNative();
+        } else {
+          await startZXing();
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus('Nie udało się uruchomić kamery.');
+        await stop();
+      }
+    }
+
+    async function stop() {
+      scanning = false;
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      torchBtn.disabled = true;
+
+      // Stop native
+      if (nativeRAF) cancelAnimationFrame(nativeRAF);
+      if (nativeTrack) nativeTrack.stop();
+      if (nativeStream) nativeStream.getTracks().forEach(t => t.stop());
+      nativeDetector = null; nativeTrack = null; nativeStream = null;
+
+      // Stop ZXing
+      try { zxingReader?.reset(); } catch {}
+      setStatus('zatrzymane.');
+    }
+
+    async function setupTorch(track) {
+      if (!track) { torchBtn.disabled = true; return; }
+      const caps = track.getCapabilities?.();
+      torchBtn.disabled = !(caps && 'torch' in caps);
+      if (!torchBtn.disabled) {
+        torchBtn.onclick = async () => {
+          try {
+            torchOn = !torchOn;
+            await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+            torchBtn.textContent = torchOn ? '🔦 Latarka (ON)' : '🔦 Latarka';
+          } catch { torchBtn.disabled = true; }
+        };
+      }
+    }
+
+    copyBtn.addEventListener('click', async () => {
+      const t = valueEl.textContent.trim();
+      if (!t || t === '—') return;
+      try { await navigator.clipboard.writeText(t); setStatus('Skopiowano do schowka.', true); }
+      catch { setStatus('Nie udało się skopiować.'); }
+    });
+
+    cameraSel.addEventListener('change', async () => {
+      currentDeviceId = cameraSel.value || null;
+      if (scanning) { await stop(); await start(); }
+    });
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    useManual.addEventListener('click', () => {
+      const v = (manual.value || '').trim();
+      if (!v) return;
+      valueEl.textContent = v;
+      metaEl.textContent = `Format: (ręcznie) • Próby: ${tries}`;
+      setStatus('✔ Wartość ustawiona ręcznie', true);
+      copyBtn.disabled = false;
+    });
+
+    (async () => {
+      // iOS/Chrome require user gesture before enumerateDevices yields labels; get a quick stream then stop.
+      try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch {}
+      await listCameras();
+    })();
+
+    window.addEventListener('pagehide', stop);
+    window.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
+  </script>
+</body>
+</html>
